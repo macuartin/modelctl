@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "id": "macuartin.modelctl",
+  "name": "modelctl",
+  "version": "0.2.0",
+  "author": "Miguel Cuartin",
+  "license": "MIT",
+  "description": "llama.cpp router in the bar: which models are loaded, which failed, memory pressure, and one click to load or unload. Summon with: omarchy-shell shell toggle macuartin.modelctl",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "modelctl",
+    "description": "llama.cpp router status and model lifecycle",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "modelctlPath": "",
+      "notifyFailed": true,
+      "routerUrl": "",
+      "apiKeyFile": ""
+    },
+    "schema": [
+      {
+        "key": "modelctlPath",
+        "type": "string",
+        "label": "Path to the modelctl helper",
+        "defaultValue": "",
+        "description": "Defaults to ~/.local/bin/modelctl"
+      },
+      {
+        "key": "notifyFailed",
+        "type": "boolean",
+        "label": "Notify when a model enters the failed state",
+        "defaultValue": true
+      },
+      {
+        "key": "routerUrl",
+        "type": "string",
+        "label": "Router URL",
+        "defaultValue": "",
+        "description": "Defaults to http://127.0.0.1:8080"
+      },
+      {
+        "key": "apiKeyFile",
+        "type": "path",
+        "label": "API key file",
+        "defaultValue": "",
+        "description": "File containing API_KEY=. Defaults to ~/.config/llama-server.env"
+      }
+    ]
+  }
+}

@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""Manage the local llama.cpp router on :8080.
+
+Replaces ia-stack, which also drove ComfyUI. ComfyUI is gone from this machine,
+so this only handles the text router: what is loaded, what fits, load, unload.
+
+The router is the single source of truth. Model config (load-on-startup,
+embeddings, reranking) is read from status.preset, which is the .ini text the
+router parsed; the live context size comes from status.args, because the preset
+can drift from the running process.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROUTER = os.environ.get("LLAMA_ROUTER", "http://127.0.0.1:8080")
+ENV_FILE = Path(os.environ.get("LLAMA_ENV_FILE") or
+                (Path.home() / ".config" / "llama-server.env"))
+
+# Loading the titular after a reboot takes minutes; unloading is quick.
+LOAD_TIMEOUT = 300
+UNLOAD_TIMEOUT = 60
+
+SCHEMA_VERSION = 1
+
+# A model with any of these in its preset is protected from unload: andino-kb
+# needs the embedding and reranker, and the startup set is what agents expect
+# to find loaded.
+PROTECTED_KEYS = {
+    "load-on-startup": "load-on-startup",
+    "embeddings": "embeddings",
+    "reranking": "reranking",
+}
+
+
+def api_key():
+    try:
+        for line in ENV_FILE.read_text().splitlines():
+            if line.startswith("API_KEY="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return os.environ.get("LLAMA_API_KEY", "")
+
+
+def request_json(path, payload=None, timeout=5):
+    url = f"{ROUTER}{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+    req.add_header("Authorization", f"Bearer {api_key()}")
+    if data:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode()
+    return json.loads(body) if body else {}
+
+
+def memory_mib():
+    """Used and total MiB of the pool the models live in, plus its label.
+
+    GTT is where an AMD APU keeps them; a discrete card reports VRAM instead.
+    Neither exists on plain NVIDIA, and the caller renders nothing rather than
+    lying with zeroes.
+    """
+    for pool in ("gtt", "vram"):
+        for dev in sorted(Path("/sys/class/drm").glob("card*/device")):
+            total = dev / f"mem_info_{pool}_total"
+            used = dev / f"mem_info_{pool}_used"
+            if not total.is_file():
+                continue
+            try:
+                return (
+                    int(used.read_text()) // 1024 // 1024,
+                    int(total.read_text()) // 1024 // 1024,
+                    pool.upper(),
+                )
+            except (OSError, ValueError):
+                continue
+    return 0, 0, ""
+
+
+def router_argv():
+    """argv of the running router, or [] when it is not up."""
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            argv = (proc / "cmdline").read_bytes().decode().split("\0")
+        except OSError:
+            continue
+        if any("llama-server" in a for a in argv) and "--models-preset" in argv:
+            return argv
+        if any("llama-server" in a for a in argv) and "--models-dir" in argv:
+            return argv
+    return []
+
+
+def model_sources():
+    """Where the router discovers models: the preset file, a directory, or both.
+
+    Read from the live process rather than configured here, so the panel points
+    at whatever this machine actually runs.
+    """
+    argv = router_argv()
+    out = {"presetFile": "", "modelsDir": ""}
+    for flag, key in (("--models-preset", "presetFile"), ("--models-dir", "modelsDir")):
+        if flag in argv:
+            idx = argv.index(flag)
+            if idx + 1 < len(argv):
+                out[key] = argv[idx + 1]
+    return out
+
+
+def models_max():
+    """--models-max the router actually runs with, or 0 when it cannot be read.
+
+    0 means unknown here, not unlimited. llama.cpp documents 0 as unlimited but
+    refuses to start with it when any model is load-on-startup ("number of
+    models to load on startup (4) exceeds models_max (0)"), so nothing should
+    treat 0 as a real cap either way. Returning a plausible default instead
+    would have the panel state a limit nobody set.
+    """
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            argv = (proc / "cmdline").read_bytes().decode().split("\0")
+        except OSError:
+            continue
+        if not any("llama-server" in a for a in argv):
+            continue
+        if "--models-max" in argv:
+            idx = argv.index("--models-max")
+            if idx + 1 < len(argv):
+                try:
+                    return int(argv[idx + 1])
+                except ValueError:
+                    pass
+    return 0
+
+
+def parse_preset(text):
+    """The preset is .ini text; pull out the boolean keys we care about."""
+    keys = {}
+    for raw in (text or "").splitlines():
+        line = raw.split(";", 1)[0].strip()
+        if not line or line.startswith("[") or "=" not in line:
+            continue
+        k, v = (x.strip() for x in line.split("=", 1))
+        keys[k] = v
+    return keys
+
+
+def arg_value(args, flag):
+    if not isinstance(args, list):
+        return None
+    if flag in args:
+        idx = args.index(flag)
+        if idx + 1 < len(args):
+            return args[idx + 1]
+    return None
+
+
+def fetch_models():
+    """Normalized model list, or None when the router does not answer."""
+    try:
+        data = request_json("/v1/models")
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return None
+
+    out = []
+    for entry in data.get("data", []):
+        status = entry.get("status") or {}
+        preset = parse_preset(status.get("preset"))
+
+        # A failed model reports value "unloaded" like a healthy one. Keeping
+        # them apart is the whole point: on 2026-08-24 three models sat failed
+        # for hours looking merely idle.
+        state = str(status.get("value") or "unknown")
+        if status.get("failed"):
+            state = "failed"
+
+        reasons = [label for key, label in PROTECTED_KEYS.items()
+                   if preset.get(key, "").lower() == "true"]
+
+        ctx = arg_value(status.get("args"), "--ctx-size") or preset.get("c") or preset.get("ctx-size")
+        try:
+            ctx = int(ctx)
+        except (TypeError, ValueError):
+            ctx = None
+
+        out.append({
+            "id": entry.get("id"),
+            "state": state,
+            "protected": bool(reasons),
+            "protectedReason": reasons[0] if reasons else None,
+            "exitCode": status.get("exit_code"),
+            "contextSize": ctx,
+            "progress": None,
+            "stage": None,
+        })
+    out.sort(key=lambda m: m["id"] or "")
+    return out
+
+
+def build_status():
+    used, total, pool = memory_mib()
+    models = fetch_models()
+    reachable = models is not None
+    models = models or []
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "router": {
+            "reachable": reachable,
+            "url": ROUTER,
+            "modelsMax": models_max(),
+            "sources": model_sources(),
+            "loadedCount": sum(1 for m in models if m["state"] == "loaded"),
+        },
+        "memory": {
+            "pool": pool,
+            "usedMiB": used,
+            "totalMiB": total,
+            "percent": round(used * 100 / total) if total else 0,
+        },
+        "models": models,
+    }
+
+
+MARK = {"loaded": "●", "failed": "⚠", "loading": "◐"}
+
+
+def render(status):
+    mem = status["memory"]
+    if mem["totalMiB"]:
+        free_gib = (mem["totalMiB"] - mem["usedMiB"]) // 1024
+        print("{:<8} {:.1f} / {:.1f} GiB  ({}%)   free: ~{} GiB".format(
+            mem["pool"], mem["usedMiB"] / 1024, mem["totalMiB"] / 1024,
+            mem["percent"], free_gib))
+
+    router = status["router"]
+    if not router["reachable"]:
+        parts = urllib.parse.urlsplit(router["url"])
+        where = f":{parts.port}" if parts.hostname in ("127.0.0.1", "localhost") else parts.netloc
+        print(f"Router   {where}  ⚠ not responding")
+        return
+
+    parts = urllib.parse.urlsplit(router["url"])
+    where = f":{parts.port}" if parts.hostname in ("127.0.0.1", "localhost") else parts.netloc
+    head = f"Router   {where}  ".ljust(16)
+    pad = " " * len(head)
+    if not status["models"]:
+        print(head + "no models registered")
+    for i, m in enumerate(status["models"]):
+        prefix = head if i == 0 else pad
+        mark = MARK.get(m["state"], "○")
+        line = f"{prefix}{mark} {m['id']}"
+        if m["state"] == "failed":
+            line += f" (FAILED, exit {m['exitCode']})"
+        elif m["state"] != "loaded":
+            line += " (unloaded)"
+        if m["protected"]:
+            line += f"  [{m['protectedReason']}]"
+        print(line)
+
+    if router["modelsMax"] > 0:
+        print(f"\n{router['loadedCount']} of {router['modelsMax']} slots in use")
+    else:
+        print(f"\n{router['loadedCount']} models loaded (slot cap unknown)")
+    failed = [m for m in status["models"] if m["state"] == "failed"]
+    if failed:
+        print("\n⚠ Failed to load: " + ", ".join(m["id"] for m in failed))
+        # restore only touches the startup set, so pointing anyone else at it
+        # sends them to a command that will ignore their model.
+        startup = [m["id"] for m in failed if m["protectedReason"] == "load-on-startup"]
+        if startup:
+            print("  Retry with: modelctl restore")
+        for m in failed:
+            if m["protectedReason"] != "load-on-startup":
+                print(f"  Retry with: modelctl load {m['id']}")
+        print("  The reason is in: journalctl -u llama-server")
+
+
+def find(status, model_id):
+    for m in status["models"]:
+        if m["id"] == model_id:
+            return m
+    return None
+
+
+def wait_for(model_id, want, timeout):
+    """POST returns before the work is done, so poll GET /models or we lie."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        models = fetch_models()
+        if models is not None:
+            for m in models:
+                if m["id"] == model_id:
+                    if m["state"] == want:
+                        return True, m["state"]
+                    if m["state"] == "failed":
+                        return False, "failed"
+        time.sleep(1)
+    current = find(build_status(), model_id)
+    return False, current["state"] if current else "?"
+
+
+def do_action(action, model_id, force):
+    status = build_status()
+    if not status["router"]["reachable"]:
+        print("⚠ the router is not responding", file=sys.stderr)
+        return 1
+
+    model = find(status, model_id)
+    if model is None:
+        print(f"modelctl: '{model_id}' is not registered in the router. Models:", file=sys.stderr)
+        for m in status["models"]:
+            print("  " + m["id"], file=sys.stderr)
+        return 1
+
+    want = "loaded" if action == "load" else "unloaded"
+    if model["state"] == want:
+        print(f"  · {model_id} was already {want}")
+        render(status)
+        return 0
+
+    if action == "unload" and model["protected"] and not force:
+        print(f"⚠ '{model_id}' is protected ({model['protectedReason']}). "
+              f"Repeat with --force if you really mean it.", file=sys.stderr)
+        return 1
+
+    if action == "load":
+        router = status["router"]
+        if router["modelsMax"] > 0 and router["loadedCount"] >= router["modelsMax"]:
+            print(f"  ⚠ {router['loadedCount']} models are already loaded "
+                  f"(--models-max {router['modelsMax']}): this load evicts another one")
+
+    print(f"→ {'Loading' if action == 'load' else 'Unloading'} {model_id}")
+    try:
+        request_json(f"/models/{action}", payload={"model": model_id}, timeout=30)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"  · {action} {model_id} ... FAILED (the router rejected the request: {exc})",
+              file=sys.stderr)
+        return 1
+
+    timeout = LOAD_TIMEOUT if action == "load" else UNLOAD_TIMEOUT
+    ok, state = wait_for(model_id, want, timeout)
+    if ok:
+        print(f"  · {action} {model_id} ... {want}")
+    else:
+        print(f"  ⚠ still '{state}' after {timeout}s "
+              f"(check journalctl -u llama-server)", file=sys.stderr)
+
+    print()
+    render(build_status())
+    return 0 if ok else 1
+
+
+def cmd_restore(force):
+    """Reload every load-on-startup model. The rescue after a failed boot."""
+    status = build_status()
+    if not status["router"]["reachable"]:
+        print("⚠ the router is not responding", file=sys.stderr)
+        return 1
+
+    targets = [m for m in status["models"] if m["protectedReason"] == "load-on-startup"]
+    if not targets:
+        print("No models are marked load-on-startup")
+        return 0
+
+    rc = 0
+    for m in targets:
+        if m["state"] == "loaded":
+            print(f"  · {m['id']} was already loaded")
+            continue
+        # One at a time: four concurrent loads is not something to ask of the router.
+        if do_action("load", m["id"], force) != 0:
+            rc = 1
+    if rc:
+        print("\n⚠ Something did not come back. Without it, agents get "
+              "400 model is not loaded.", file=sys.stderr)
+    return rc
+
+
+
+
+# ---------------------------------------------------------------- watch
+#
+# GET /models/sse pushes the model lifecycle: loading with per-stage progress,
+# loaded with metadata, unloaded with an exit code. Watching it beats polling
+# on every axis that matters here: a failure shows up the moment it happens
+# instead of up to one poll interval later, a minutes-long load gets a real
+# progress bar, and nothing spawns a process every N seconds forever.
+#
+# Emits NDJSON: one complete snapshot per line, so the reader never has to
+# merge partial state.
+
+# The build emits "status_change"; the documented "model_status" arrives only
+# as the first event of a stream. Accept both.
+STATUS_EVENTS = ("status_change", "model_status")
+
+# Progress arrives many times per second. Redrawing a bar faster than this
+# buys nothing and costs a wakeup per event.
+EMIT_INTERVAL = 0.2
+
+
+def emit(state):
+    used, total, pool = memory_mib()
+    state["memory"] = {
+        "pool": pool,
+        "usedMiB": used,
+        "totalMiB": total,
+        "percent": round(used * 100 / total) if total else 0,
+    }
+    state["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    state["router"]["loadedCount"] = sum(
+        1 for m in state["models"] if m["state"] == "loaded")
+    json.dump(state, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def unreachable_state():
+    state = build_status()
+    state["router"]["reachable"] = False
+    state["models"] = []
+    return state
+
+
+def apply_event(state, evt):
+    """Fold one SSE event into the snapshot. True when a full refresh is due."""
+    model_id = evt.get("model")
+    kind = evt.get("event")
+    data = evt.get("data") or {}
+
+    if kind in ("models_reload", "model_remove") or model_id == "*":
+        return True
+
+    row = next((m for m in state["models"] if m["id"] == model_id), None)
+    if row is None:
+        return True
+
+    if kind not in STATUS_EVENTS:
+        return False
+
+    status = data.get("status")
+    if status == "loading":
+        row["state"] = "loading"
+        progress = data.get("progress") or {}
+        row["stage"] = progress.get("current")
+        row["progress"] = progress.get("value")
+        return False
+
+    # loaded / unloaded / sleeping all settle the row, and a non-zero exit on
+    # unload is the failure this widget exists to surface.
+    row["progress"] = None
+    row["stage"] = None
+    if status == "unloaded" and data.get("exit_code"):
+        row["state"] = "failed"
+        row["exitCode"] = data.get("exit_code")
+        return False
+    row["state"] = status or row["state"]
+    if status == "loaded":
+        row["exitCode"] = None
+    return status in ("loaded", "unloaded")
+
+
+def stream_events(state):
+    req = urllib.request.Request(f"{ROUTER}/models/sse")
+    req.add_header("Authorization", f"Bearer {api_key()}")
+    req.add_header("Accept", "text/event-stream")
+    last_emit = 0.0
+    with urllib.request.urlopen(req) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                evt = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            needs_refresh = apply_event(state, evt)
+            if needs_refresh:
+                fresh = fetch_models()
+                if fresh is not None:
+                    state["models"] = fresh
+                    state["router"]["modelsMax"] = models_max()
+            now = time.monotonic()
+            if needs_refresh or now - last_emit >= EMIT_INTERVAL:
+                emit(state)
+                last_emit = now
+
+
+def cmd_watch():
+    """Follow the router forever. Survives the router restarting under it."""
+    while True:
+        state = build_status()
+        emit(state)
+        if state["router"]["reachable"]:
+            try:
+                stream_events(state)
+            except (urllib.error.URLError, OSError, ValueError):
+                pass
+            # The stream ended: either the router went away or it restarted.
+            emit(unreachable_state())
+        time.sleep(3)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="modelctl", description="Manage the local llama.cpp router (:8080)")
+    parser.add_argument("--force", "-f", action="store_true",
+                        help="bypass the protection on critical models")
+    parser.add_argument("--router", metavar="URL",
+                        help="router URL (default http://127.0.0.1:8080)")
+    parser.add_argument("--api-key-file", metavar="PATH",
+                        help="file holding API_KEY= (default ~/.config/llama-server.env)")
+    sub = parser.add_subparsers(dest="command")
+
+    p_status = sub.add_parser("status", help="router status")
+    p_status.add_argument("--json", action="store_true", help="machine-readable output")
+
+    p_load = sub.add_parser("load", help="load a model")
+    p_load.add_argument("model")
+
+    p_unload = sub.add_parser("unload", help="unload a model")
+    p_unload.add_argument("model")
+
+    sub.add_parser("restore", help="reload the load-on-startup set")
+    sub.add_parser("watch", help="stream snapshots as NDJSON, driven by /models/sse")
+
+    args = parser.parse_args()
+    command = args.command or "status"
+
+    # Globals, because every helper below reads them; argparse is the only
+    # place that knows the user asked for a different router.
+    global ROUTER, ENV_FILE
+    if args.router:
+        ROUTER = args.router.rstrip("/")
+    if args.api_key_file:
+        ENV_FILE = Path(args.api_key_file).expanduser()
+
+    if command == "status":
+        status = build_status()
+        if getattr(args, "json", False):
+            json.dump(status, sys.stdout, indent=2, ensure_ascii=False)
+            print()
+        else:
+            render(status)
+        return 0
+    if command == "load":
+        return do_action("load", args.model, args.force)
+    if command == "unload":
+        return do_action("unload", args.model, args.force)
+    if command == "restore":
+        return cmd_restore(args.force)
+    if command == "watch":
+        try:
+            cmd_watch()
+        except KeyboardInterrupt:
+            pass
+        return 0
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
