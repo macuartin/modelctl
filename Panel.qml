@@ -72,7 +72,9 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰧑"
+    // Swaps while data is in flight: without it a middle-click refresh looks
+    // like a click that did nothing.
+    text: service.loading ? "󰑓" : "󰧑"
     active: root.alarming
     onPressed: function (buttonCode) {
       if (buttonCode === Qt.MiddleButton) service.refresh()
@@ -128,7 +130,7 @@ Panel {
             width: parent.width
             foreground: root.foreground
             fontFamily: root.fontFamily
-            title: "Router :8080"
+            title: Model.routerLabel(snap)
             meta: snap.reachable ? Model.slotsText(snap) : "no response"
             detail: snap.reachable ? Model.memText(snap) : "not responding"
           }
@@ -204,8 +206,7 @@ Panel {
                 }
                 Text {
                   width: parent.width
-                  text: Model.stateLabel(modelData) +
-                        (modelData.protected ? "  ·  " + modelData.protectedReason : "")
+                  text: Model.detailLine(modelData)
                   color: modelData.state === "failed" ? root.urgent : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -291,13 +292,29 @@ Panel {
           }
 
           Text {
+            id: retryHint
             width: parent.width
             visible: snap.reachable && Model.failedModels(snap).length > 0
-            text: Model.retryHint(snap)
-            color: root.dim
+            // The advice differs per case (restore vs the button), but the
+            // logs are where the reason lives either way, so the whole line
+            // opens them.
+            text: Model.retryHint(snap) + "  ·  open logs"
+            color: hintArea.containsMouse ? root.foreground : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+
+            MouseArea {
+              id: hintArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (!root.bar) return
+                root.bar.run("omarchy-launch-tui journalctl --unit llama-server --follow -n 100")
+                root.close()
+              }
+            }
           }
         }
       }

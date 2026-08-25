@@ -8,6 +8,7 @@ function emptySnapshot() {
     reachable: false,
     modelsMax: 0,
     loadedCount: 0,
+    url: "",
     presetFile: "",
     modelsDir: "",
     memPool: "",
@@ -39,6 +40,7 @@ function parseSnapshot(text) {
   snap.modelsMax = router.modelsMax || 0
   snap.loadedCount = router.loadedCount || 0
   var sources = router.sources || {}
+  snap.url = router.url || ""
   snap.presetFile = sources.presetFile || ""
   snap.modelsDir = sources.modelsDir || ""
   snap.memPool = mem.pool || ""
@@ -110,6 +112,29 @@ function stateLabel(model) {
 function slotsText(snap) {
   if (snap.modelsMax > 0) return snap.loadedCount + " of " + snap.modelsMax + " slots"
   return snap.loadedCount + (snap.loadedCount === 1 ? " model loaded" : " models loaded")
+}
+
+// Same shorthand as the CLI: ":8080" for a local router, host:port otherwise.
+function routerLabel(snap) {
+  var m = String(snap.url || "").match(/^https?:\/\/([^\/?#]+?)(:\d+)?(?:[\/?#]|$)/)
+  if (!m || !m[1]) return "Router"
+  if (m[1] === "127.0.0.1" || m[1] === "localhost" || m[1] === "::1") return "Router " + (m[2] || "")
+  return "Router " + m[1] + (m[2] || "")
+}
+
+function ctxText(model) {
+  var ctx = model.contextSize
+  if (!ctx) return ""
+  return ctx >= 1024 ? "ctx " + Math.round(ctx / 1024) + "k" : "ctx " + ctx
+}
+
+// The whole second line of a model row: state, context, protection.
+function detailLine(model) {
+  var parts = [stateLabel(model)]
+  var ctx = ctxText(model)
+  if (ctx) parts.push(ctx)
+  if (model.protected && model.protectedReason) parts.push(model.protectedReason)
+  return parts.join("  ·  ")
 }
 
 // Empty when the machine exposes no readable pool (plain NVIDIA), so the panel

@@ -109,7 +109,7 @@ QtObject {
     if (fresh.length > 0) {
       notifyProc.command = ["notify-send", "-u", "critical", "-a", "modelctl",
                             "Model down in the router",
-                            fresh.join(", ") + " failed to load. Try: modelctl restore"]
+                            fresh.join(", ") + " failed to load. " + Model.retryHint(snap)]
       notifyProc.running = true
     }
   }

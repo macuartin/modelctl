@@ -87,8 +87,14 @@ def memory_mib():
     return 0, 0, ""
 
 
-def router_argv():
-    """argv of the running router, or [] when it is not up."""
+def find_router_proc():
+    """argv of the running router, or None when it is not up.
+
+    One pass over /proc serves every caller that wants a piece of the command
+    line (sources, --models-max); three separate scans read every PID three
+    times for the same bytes.
+    """
+    candidates = []
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
             continue
@@ -96,30 +102,32 @@ def router_argv():
             argv = (proc / "cmdline").read_bytes().decode().split("\0")
         except OSError:
             continue
-        if any("llama-server" in a for a in argv) and "--models-preset" in argv:
+        if any("llama-server" in a for a in argv):
+            candidates.append(argv)
+    # The text router is the one with model discovery flags; a bare
+    # llama-server (single-model mode) still counts if nothing better exists.
+    for argv in candidates:
+        if "--models-preset" in argv or "--models-dir" in argv:
             return argv
-        if any("llama-server" in a for a in argv) and "--models-dir" in argv:
-            return argv
-    return []
+    return candidates[0] if candidates else None
 
 
-def model_sources():
+def model_sources(proc):
     """Where the router discovers models: the preset file, a directory, or both.
 
     Read from the live process rather than configured here, so the panel points
     at whatever this machine actually runs.
     """
-    argv = router_argv()
     out = {"presetFile": "", "modelsDir": ""}
     for flag, key in (("--models-preset", "presetFile"), ("--models-dir", "modelsDir")):
-        if flag in argv:
-            idx = argv.index(flag)
-            if idx + 1 < len(argv):
-                out[key] = argv[idx + 1]
+        if flag in proc:
+            idx = proc.index(flag)
+            if idx + 1 < len(proc):
+                out[key] = proc[idx + 1]
     return out
 
 
-def models_max():
+def models_max(proc):
     """--models-max the router actually runs with, or 0 when it cannot be read.
 
     0 means unknown here, not unlimited. llama.cpp documents 0 as unlimited but
@@ -128,22 +136,13 @@ def models_max():
     treat 0 as a real cap either way. Returning a plausible default instead
     would have the panel state a limit nobody set.
     """
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            argv = (proc / "cmdline").read_bytes().decode().split("\0")
-        except OSError:
-            continue
-        if not any("llama-server" in a for a in argv):
-            continue
-        if "--models-max" in argv:
-            idx = argv.index("--models-max")
-            if idx + 1 < len(argv):
-                try:
-                    return int(argv[idx + 1])
-                except ValueError:
-                    pass
+    if "--models-max" in proc:
+        idx = proc.index("--models-max")
+        if idx + 1 < len(proc):
+            try:
+                return int(proc[idx + 1])
+            except ValueError:
+                pass
     return 0
 
 
@@ -207,7 +206,12 @@ def fetch_models():
             "progress": None,
             "stage": None,
         })
-    out.sort(key=lambda m: m["id"] or "")
+    # Failed first, then whatever is in flight: the panel scrolls and a
+    # failure buried at the bottom of twelve rows is invisible, which is the
+    # exact situation this widget exists to prevent.
+    STATE_RANK = {"failed": 0, "loading": 1, "unloading": 1,
+                  "loaded": 2, "sleeping": 3}
+    out.sort(key=lambda m: (STATE_RANK.get(m["state"], 4), m["id"] or ""))
     return out
 
 
@@ -216,14 +220,15 @@ def build_status():
     models = fetch_models()
     reachable = models is not None
     models = models or []
+    proc = find_router_proc() or []
     return {
         "schemaVersion": SCHEMA_VERSION,
         "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "router": {
             "reachable": reachable,
             "url": ROUTER,
-            "modelsMax": models_max(),
-            "sources": model_sources(),
+            "modelsMax": models_max(proc),
+            "sources": model_sources(proc),
             "loadedCount": sum(1 for m in models if m["state"] == "loaded"),
         },
         "memory": {
@@ -413,7 +418,10 @@ STATUS_EVENTS = ("status_change", "model_status")
 EMIT_INTERVAL = 0.2
 
 
-def emit(state):
+def finalize(state):
+    """Fold the live values (memory, counters) into the snapshot."""
+    state["router"]["loadedCount"] = sum(
+        1 for m in state["models"] if m["state"] == "loaded")
     used, total, pool = memory_mib()
     state["memory"] = {
         "pool": pool,
@@ -421,9 +429,21 @@ def emit(state):
         "totalMiB": total,
         "percent": round(used * 100 / total) if total else 0,
     }
+
+
+def fingerprint(state):
+    """Canonical form of what the widget renders, timestamps aside.
+
+    Most SSE events carry no visible change; comparing this against the last
+    emitted snapshot is what keeps identical lines from reaching QML, where
+    every one of them re-evaluates bindings and repaints for nothing.
+    """
+    body = {k: v for k, v in state.items() if k != "updatedAt"}
+    return json.dumps(body, sort_keys=True)
+
+
+def emit(state):
     state["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    state["router"]["loadedCount"] = sum(
-        1 for m in state["models"] if m["state"] == "loaded")
     json.dump(state, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -474,7 +494,12 @@ def apply_event(state, evt):
     return status in ("loaded", "unloaded")
 
 
-def stream_events(state):
+def stream_events(state, last_fp):
+    """Follow the SSE stream, printing only snapshots that differ from last_fp.
+
+    Returns the fingerprint of the last emitted snapshot, so a reconnect does
+    not replay what the reader already has.
+    """
     req = urllib.request.Request(f"{ROUTER}/models/sse")
     req.add_header("Authorization", f"Bearer {api_key()}")
     req.add_header("Accept", "text/event-stream")
@@ -493,25 +518,42 @@ def stream_events(state):
                 fresh = fetch_models()
                 if fresh is not None:
                     state["models"] = fresh
-                    state["router"]["modelsMax"] = models_max()
+                    state["router"]["modelsMax"] = models_max(find_router_proc() or [])
+            finalize(state)
+            fp = fingerprint(state)
             now = time.monotonic()
-            if needs_refresh or now - last_emit >= EMIT_INTERVAL:
-                emit(state)
-                last_emit = now
+            if fp == last_fp:
+                continue
+            if not (needs_refresh or now - last_emit >= EMIT_INTERVAL):
+                continue
+            emit(state)
+            last_emit = now
+            last_fp = fp
+    return last_fp
 
 
 def cmd_watch():
     """Follow the router forever. Survives the router restarting under it."""
+    last_fp = None
     while True:
         state = build_status()
-        emit(state)
+        finalize(state)
+        fp = fingerprint(state)
+        if fp != last_fp:
+            emit(state)
+            last_fp = fp
         if state["router"]["reachable"]:
             try:
-                stream_events(state)
+                last_fp = stream_events(state, last_fp)
             except (urllib.error.URLError, OSError, ValueError):
                 pass
             # The stream ended: either the router went away or it restarted.
-            emit(unreachable_state())
+            state = unreachable_state()
+            finalize(state)
+            fp = fingerprint(state)
+            if fp != last_fp:
+                emit(state)
+                last_fp = fp
         time.sleep(3)
 
 
