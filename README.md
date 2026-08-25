@@ -47,11 +47,27 @@ shows a one-line summary.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/modelctl.git --enable
+omarchy plugin add https://github.com/macuartin/modelctl.git --enable
 ```
 
 Or by hand: drop this directory in `~/.config/omarchy/plugins/macuartin.modelctl/`,
 then `omarchy-shell shell rescanPlugins` and `omarchy plugin enable macuartin.modelctl`.
+
+## Uninstall
+
+```bash
+omarchy plugin disable macuartin.modelctl
+omarchy plugin remove macuartin.modelctl
+```
+
+`disable` takes the widget out of the bar, `remove` deletes the plugin
+directory. If you also symlinked the helper into your path, drop it by hand:
+
+```bash
+rm -f ~/.local/bin/modelctl
+```
+
+The widget keeps no state of its own, so nothing else is left behind.
 
 ## Settings
 
