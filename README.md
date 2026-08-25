@@ -26,17 +26,22 @@ model enters `failed`, and the panel shows the exit code next to its name.
 - **Memory meter** for the pool the models compete for: GTT on an AMD APU, VRAM
   on a discrete card. Machines that expose neither simply get no meter.
 - **One row per model**: `●` loaded, `○` unloaded, `⚠` failed with its exit code,
-  `◌` sleeping, and a real progress bar while it loads. Models that are `load-on-startup`, an
+  `◌` sleeping, and a real progress bar while it loads. Each row shows the
+  model's context size. Rows sort by state: failed first, then whatever is in
+  flight, so a dead model is never buried under a long list. Models that are `load-on-startup`, an
   embedding, or a reranker are marked as protected.
 - **A button per row** to load or unload, with a confirmation before unloading a
   protected model or before a load that would evict another one.
+- **The retry hint when something failed**: the advice depends on the case
+  (`modelctl restore` only covers the startup set), and clicking the line opens
+  `journalctl -u llama-server` in a terminal.
 - **The model source at the bottom**: the `--models-preset` file (or the
   `--models-dir`) the running router was started with, read from its own command
   line. Click it to open that file in your Omarchy editor. Adding a model there
   needs a router restart.
 
-Left click opens the panel, middle click forces a refresh, and hovering the icon
-shows a one-line summary.
+Left click opens the panel, middle click forces a refresh (the icon flashes
+while data is in flight), and hovering the icon shows a one-line summary.
 
 ## Requirements
 
@@ -109,11 +114,12 @@ which can mean tens of gigabytes for one stray request. This widget only ever
 reads `GET /models`.
 
 **The widget follows `GET /models/sse`, it does not poll.** `scripts/modelctl watch`
-holds the stream open and prints one complete snapshot per line as NDJSON, so a
-failure reaches the bar the moment it happens and a slow load reports per-stage
-progress. The stream is restarted automatically if it dies. Note that the build
-emits `status_change` where the documentation says `model_status`; both are
-accepted.
+holds the stream open and prints one complete snapshot per line as NDJSON, and
+only when the snapshot actually differs from the last one it printed, so a
+failure reaches the bar the moment it happens, a slow load reports per-stage
+progress, and quiet periods produce no traffic at all. The stream is restarted
+automatically if it dies. Note that the build emits `status_change` where the
+documentation says `model_status`; both are accepted.
 
 **Loading is asynchronous.** The router returns `{"success":true}` long before
 the model is up, so the CLI polls until the state actually changes.

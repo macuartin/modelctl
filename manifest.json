@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "macuartin.modelctl",
   "name": "modelctl",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Miguel Cuartin",
   "license": "MIT",
   "description": "llama.cpp router in the bar: which models are loaded, which failed, memory pressure, and one click to load or unload. Summon with: omarchy-shell shell toggle macuartin.modelctl",
