@@ -2,6 +2,10 @@
 // the panel and the service can both reason about state the same way.
 .pragma library
 
+// Highest snapshot schema this file knows how to read. The helper stamps its
+// own version on every line; a newer one means the widget is the stale half.
+var SCHEMA_VERSION = 1
+
 function emptySnapshot() {
   return {
     ok: false,
@@ -31,6 +35,11 @@ function parseSnapshot(text) {
     raw = JSON.parse(text)
   } catch (e) {
     snap.error = "unreadable modelctl output"
+    return snap
+  }
+  // Absent means a helper older than the stamp, which this file still reads.
+  if (typeof raw.schemaVersion === "number" && raw.schemaVersion > SCHEMA_VERSION) {
+    snap.error = "modelctl speaks schema v" + raw.schemaVersion + ", reload or update the widget"
     return snap
   }
   var router = raw.router || {}
