@@ -43,6 +43,20 @@ model enters `failed`, and the panel shows the exit code next to its name.
 Left click opens the panel, middle click forces a refresh (the icon flashes
 while data is in flight), and hovering the icon shows a one-line summary.
 
+## Keyboard
+
+| Key | Action |
+|-----|--------|
+| `j` / `k`, `↓` / `↑` | move between model rows |
+| `enter` / `space` | load or unload the selected model (same confirmations as the button) |
+| `enter` with no selection | refresh |
+| `r` | refresh |
+| `tab` | move to the next panel |
+| `esc` | close |
+
+Enter is ignored while an action is in flight or the router is down, exactly
+like the row buttons.
+
 ## Requirements
 
 - Omarchy 4 with `omarchy-shell`.
@@ -132,6 +146,18 @@ this widget says nothing about slots rather than inventing a plausible one.
 
 **The API key never reaches QML.** Plugins run unsandboxed inside the shell, so
 the panel shells out to the helper and the helper is what reads the key file.
+
+**Snapshots carry a `schemaVersion`.** A helper newer than the widget shows one
+line asking for a reload instead of half-rendering fields it cannot read.
+
+## Tests
+
+`Model.js` is pure JavaScript with no QML imports, so the parsing and
+formatting run outside the shell:
+
+```bash
+deno run --allow-read tests/model.test.js
+```
 
 ## License
 
