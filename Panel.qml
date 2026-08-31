@@ -23,6 +23,10 @@ Panel {
   property string confirmAction: ""
   property string confirmModel: ""
 
+  // Keyboard selection over the model rows. -1 selects nothing, and enter then
+  // falls back to refresh, which is all it did before rows were walkable.
+  property int selectedIndex: -1
+
   function pathFromUrl(url) {
     var value = String(url || "")
     if (value.indexOf("file://") === 0) return decodeURIComponent(value.substring(7))
@@ -54,7 +58,10 @@ Panel {
     root.act(loaded ? "unload" : "load", model.id, false)
   }
 
-  onOpenedChanged: if (!opened) confirm.opened = false
+  onOpenedChanged: {
+    if (!opened) confirm.opened = false
+    root.selectedIndex = -1
+  }
 
   Service {
     id: service
@@ -105,7 +112,22 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
 
-      onActivateRequested: service.refresh()
+      onMoveRequested: function (dx, dy) {
+        if (dy === 0 || snap.models.length === 0) return
+        root.selectedIndex = root.selectedIndex < 0
+          ? (dy > 0 ? 0 : snap.models.length - 1)
+          : Math.max(0, Math.min(snap.models.length - 1, root.selectedIndex + dy))
+      }
+      onActivateRequested: {
+        if (root.selectedIndex >= 0 && root.selectedIndex < snap.models.length) {
+          // Same gate as the row button: a click the mouse could not make,
+          // the keyboard should not make either.
+          if (service.busy || !snap.reachable) return
+          root.requestAction(snap.models[root.selectedIndex])
+          return
+        }
+        service.refresh()
+      }
       onCloseRequested: root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (t) { if (t === "r" || t === "R") service.refresh() }
@@ -120,6 +142,13 @@ Panel {
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        function ensureVisible(item) {
+          var y = item.mapToItem(column, 0, 0).y
+          if (y < contentY) contentY = y
+          else if (y + item.height > contentY + height)
+            contentY = y + item.height - height
+        }
 
         Column {
           id: column
@@ -175,8 +204,21 @@ Panel {
 
             Item {
               required property var modelData
+              required property int index
               width: column.width
               height: Style.space(30)
+
+              readonly property bool rowSelected: index === root.selectedIndex
+              onRowSelectedChanged: if (rowSelected) flick.ensureVisible(this)
+
+              Rectangle {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(-6)
+                anchors.rightMargin: Style.space(-6)
+                radius: Style.space(5)
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                visible: parent.rowSelected
+              }
 
               Text {
                 id: mark
