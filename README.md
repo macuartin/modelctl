@@ -63,6 +63,17 @@ like the row buttons.
 - A llama.cpp server started in router mode (`--models-preset`).
 - Python 3 for the bundled helper. No third-party packages.
 
+## Running the router
+
+If you don't run the router as a service yet,
+[`docs/llama-server.service.example`](docs/llama-server.service.example) is a
+hardened systemd unit to start from: the API key lives in an owner-only file
+(`--api-key-file`) instead of the argv where `ps` shows it to every local
+process, the router binds to `127.0.0.1`, and a sandbox block takes
+`systemd-analyze security` from 9.2 UNSAFE to 3.5 OK on the box this was
+written on. Point the widget's `apiKeyFile` setting at the same key file and
+both halves read one secret.
+
 ## Install
 
 ```bash
@@ -95,7 +106,7 @@ Set them with `omarchy bar set macuartin.modelctl <key> <value>` (numbers need `
 | Key | Default | What it does |
 |---|---|---|
 | `routerUrl` | `http://127.0.0.1:8080` | Router endpoint |
-| `apiKeyFile` | `~/.config/llama-server.env` | File holding `API_KEY=` |
+| `apiKeyFile` | `~/.config/llama-server.env` | File holding `API_KEY=`, or a bare key like `--api-key-file` |
 | `modelctlPath` | bundled | Path to the helper, if you want your own |
 | `notifyFailed` | `true` | Desktop notification the first time a model fails |
 

@@ -42,10 +42,22 @@ PROTECTED_KEYS = {
 
 
 def api_key():
+    """Key from the env file, accepting both formats in the wild.
+
+    An env file carries API_KEY=...; the file llama-server's own
+    --api-key-file reads carries bare keys, one per line. Pointing this tool
+    and the server at the same file should just work, so accept either.
+    """
     try:
+        bare = ""
         for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
             if line.startswith("API_KEY="):
                 return line.split("=", 1)[1].strip()
+            if not bare and line and not line.startswith("#") and "=" not in line:
+                bare = line
+        if bare:
+            return bare
     except OSError:
         pass
     return os.environ.get("LLAMA_API_KEY", "")
@@ -565,7 +577,8 @@ def main():
     parser.add_argument("--router", metavar="URL",
                         help="router URL (default http://127.0.0.1:8080)")
     parser.add_argument("--api-key-file", metavar="PATH",
-                        help="file holding API_KEY= (default ~/.config/llama-server.env)")
+                        help="file holding API_KEY= or a bare key "
+                             "(default ~/.config/llama-server.env)")
     sub = parser.add_subparsers(dest="command")
 
     p_status = sub.add_parser("status", help="router status")

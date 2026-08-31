@@ -1,0 +1,52 @@
+# Example systemd unit for the llama.cpp router this widget watches.
+# Copy to /etc/systemd/system/llama-server.service, replace every <user> and
+# path with yours, then: systemctl daemon-reload && systemctl enable --now llama-server
+#
+# The key rides in a file, not the argv: anything in ExecStart is visible to
+# every local process through ps. Create it owner-only, one key per line:
+#   (umask 077 && openssl rand -hex 16 > ~/.config/llama-server.key)
+
+[Unit]
+Description=llama.cpp server (multi-model router)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=<user>
+Group=<user>
+# render+video is what GPU access needs on AMD; adjust for your card.
+SupplementaryGroups=render video
+ExecStart=/home/<user>/src/llama.cpp/build/bin/llama-server \
+  --models-preset /home/<user>/.config/llama-models.ini \
+  --models-max 12 --no-models-autoload \
+  --host 127.0.0.1 --port 8080 \
+  --api-key-file /home/<user>/.config/llama-server.key --metrics
+Restart=on-failure
+RestartSec=5
+
+# Hardening, adapted from omarchy-pods' librepods.service. Deliberately absent:
+# PrivateDevices/DeviceAllow (ROCm needs /dev/dri and /dev/kfd) and
+# MemoryDenyWriteExecute (the ROCm runtime may need W+X mappings). Measured
+# here with systemd-analyze security: 9.2 UNSAFE before, 3.5 OK after.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+# Models and the preset only need reading. If your llama-server downloads
+# models (-hf), carve its cache out with: ReadWritePaths=/home/<user>/.cache/llama.cpp
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

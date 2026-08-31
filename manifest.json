@@ -50,7 +50,7 @@
         "type": "path",
         "label": "API key file",
         "defaultValue": "",
-        "description": "File containing API_KEY=. Defaults to ~/.config/llama-server.env"
+        "description": "File containing API_KEY= or a bare key, like llama-server's --api-key-file. Defaults to ~/.config/llama-server.env"
       }
     ]
   }
