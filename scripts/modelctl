@@ -63,14 +63,36 @@ def api_key():
     return os.environ.get("LLAMA_API_KEY", "")
 
 
+class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """The router API never redirects, so any 3xx fails loudly instead.
+
+    urllib's default handler replays regular headers, Authorization included,
+    against whatever host the redirect names, which would hand the API key to
+    a compromised or hostile router (marketplace review, omarchy issue 2334).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(RefuseRedirect)
+
+
+def authorized_request(url, **kwargs):
+    req = urllib.request.Request(url, **kwargs)
+    # Unredirected as belt and braces: even a future opener that follows
+    # redirects again would drop this header on the way.
+    req.add_unredirected_header("Authorization", f"Bearer {api_key()}")
+    return req
+
+
 def request_json(path, payload=None, timeout=5):
-    url = f"{ROUTER}{path}"
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
-    req.add_header("Authorization", f"Bearer {api_key()}")
+    req = authorized_request(f"{ROUTER}{path}", data=data,
+                             method="POST" if data else "GET")
     if data:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with OPENER.open(req, timeout=timeout) as resp:
         body = resp.read().decode()
     return json.loads(body) if body else {}
 
@@ -512,11 +534,10 @@ def stream_events(state, last_fp):
     Returns the fingerprint of the last emitted snapshot, so a reconnect does
     not replay what the reader already has.
     """
-    req = urllib.request.Request(f"{ROUTER}/models/sse")
-    req.add_header("Authorization", f"Bearer {api_key()}")
+    req = authorized_request(f"{ROUTER}/models/sse")
     req.add_header("Accept", "text/event-stream")
     last_emit = 0.0
-    with urllib.request.urlopen(req) as resp:
+    with OPENER.open(req) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
